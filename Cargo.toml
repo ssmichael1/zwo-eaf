@@ -1,0 +1,6 @@
+[workspace]
+members = ["zwo-eaf-sys", "zwo-eaf"]
+resolver = "2"
+
+[profile.test]
+opt-level = 3
