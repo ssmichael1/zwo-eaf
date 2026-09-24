@@ -31,8 +31,17 @@ cargo build --release
 cargo run --example list
 ```
 
-A sibling `../EAF_SDK_V1.8.1/` checkout next to this repo is also picked up
-automatically. See `zwo-eaf-sys/README.md` for the full resolution order.
+An `EAF_SDK_V1.8.1/` checkout next to this repo (or next to any parent
+directory) is also picked up automatically. See `zwo-eaf-sys/README.md` for
+the full resolution order.
+
+On macOS the stock SDK creates a Bluetooth `CBCentralManager` before `main`.
+macOS kills the process at startup, with no output, unless the app that
+launched it declares Bluetooth usage. Terminal.app does not. By default
+`zwo-eaf-sys` removes the SDK's Bluetooth code, so USB use, `cargo test` and
+the examples work from any terminal. With the `bluetooth` feature that code
+is kept, and apps must add `NSBluetoothAlwaysUsageDescription` to their
+bundle's `Info.plist`. See "macOS notes" in `zwo-eaf-sys/README.md`.
 
 On Linux, install the SDK's udev rule so the HID device is accessible without
 root:

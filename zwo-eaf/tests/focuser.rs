@@ -1,26 +1,52 @@
 //! Integration tests requiring a physical ZWO EAF focuser.
 //!
 //! All tests are `#[ignore]`d so `cargo test` passes without hardware, and
-//! none of them move the focuser. Run them with:
+//! none of them move the focuser. With no focuser attached each test prints
+//! a note and passes. Run them with:
 //!
 //! ```sh
 //! cargo test -p zwo-eaf -- --ignored --nocapture --test-threads=1
 //! ```
 
+use std::sync::{Mutex, MutexGuard};
 use zwo_eaf::*;
 
-fn open_first() -> Focuser {
+/// Serializes tests: they all open the same focuser, and a second open of an
+/// ID that is already open returns [`Error::AlreadyOpen`].
+fn hardware() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The first attached focuser, or `None` (after printing a skip note) if
+/// nothing is plugged in.
+fn first_info() -> Option<FocuserInfo> {
     let list = connected_focusers().expect("enumerate focusers");
-    assert!(!list.is_empty(), "no EAF focuser attached");
-    eprintln!("using {:?}", list[0]);
-    Focuser::open(list[0].id).expect("open focuser")
+    match list.into_iter().next() {
+        Some(info) => {
+            eprintln!("using {info:?}");
+            Some(info)
+        }
+        None => {
+            eprintln!("no EAF focuser attached; skipping");
+            None
+        }
+    }
+}
+
+fn open_first() -> Option<Focuser> {
+    first_info().map(|info| Focuser::open(info.id).expect("open focuser"))
 }
 
 #[test]
 #[ignore]
 fn enumerate() {
+    let _hw = hardware();
     let list = connected_focusers().expect("enumerate focusers");
-    assert!(!list.is_empty(), "no EAF focuser attached");
+    if list.is_empty() {
+        eprintln!("no EAF focuser attached; skipping");
+        return;
+    }
     for f in &list {
         eprintln!("id={} name={:?} max_step={}", f.id, f.name, f.max_step);
         assert!(f.max_step > 0);
@@ -30,7 +56,8 @@ fn enumerate() {
 #[test]
 #[ignore]
 fn read_state() {
-    let eaf = open_first();
+    let _hw = hardware();
+    let Some(eaf) = open_first() else { return };
     let info = eaf.info().unwrap();
     let pos = eaf.position().unwrap();
     assert!(
@@ -61,7 +88,8 @@ fn read_state() {
 #[test]
 #[ignore]
 fn control_caps() {
-    let eaf = open_first();
+    let _hw = hardware();
+    let Some(eaf) = open_first() else { return };
     for c in eaf.control_caps().unwrap() {
         eprintln!("{c:?}");
     }
@@ -70,11 +98,21 @@ fn control_caps() {
 #[test]
 #[ignore]
 fn reopen_after_drop() {
-    let list = connected_focusers().unwrap();
-    let id = list[0].id;
+    let _hw = hardware();
+    let Some(info) = first_info() else { return };
     {
-        let _a = Focuser::open(id).unwrap();
+        let _a = Focuser::open(info.id).unwrap();
     }
-    let b = Focuser::open(id).expect("reopen after drop");
+    let b = Focuser::open(info.id).expect("reopen after drop");
     b.position().unwrap();
+}
+
+#[test]
+#[ignore]
+fn double_open_is_rejected() {
+    let _hw = hardware();
+    let Some(a) = open_first() else { return };
+    assert_eq!(Focuser::open(a.id()).unwrap_err(), Error::AlreadyOpen);
+    // The rejected open must leave the first handle working.
+    a.position().expect("first handle still open");
 }

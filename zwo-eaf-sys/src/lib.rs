@@ -13,7 +13,8 @@
 //!    macOS, `EAF_Windows_SDK_V1.8.1/` on Windows).
 //! 2. `ZWO_EAF_SDK_TARBALL` — a local copy of the per-target tarball from the
 //!    GitHub release (checksum verified, then extracted into `OUT_DIR`).
-//! 3. A sibling `EAF_SDK_V1.8.1/` directory next to the crate or workspace.
+//! 3. An `EAF_SDK_V1.8.1/` directory in the crate's parent directory or any
+//!    ancestor (for example next to the workspace).
 //! 4. Download from the `sdk-1.8.1` release of the
 //!    [zwo-eaf](https://github.com/ssmichael1/zwo-eaf) repository, verified
 //!    against a SHA-256 pinned in `build.rs` and cached in `OUT_DIR`.
@@ -22,18 +23,30 @@
 //!
 //! | OS | Arch | Linkage |
 //! |----|------|---------|
-//! | macOS | aarch64, x86_64 | static `libEAFFocuser.a` + IOKit/CoreFoundation/Foundation/Cocoa/AppKit/CoreBluetooth |
+//! | macOS | aarch64, x86_64 | static `libEAFFocuser.a` + IOKit/CoreFoundation/Foundation/Cocoa/AppKit (+ CoreBluetooth with `bluetooth`) |
 //! | Linux | x86_64, x86, armv6, armv7, aarch64 | static `libEAFFocuser.a` + `libstdc++`, `libdl` |
 //! | Windows | x86_64, x86 | `EAF_focuser.dll` via import library |
 //!
 //! On Linux the focuser is a USB HID device; install the `eaf.rules` udev
 //! rule shipped with the SDK for non-root access (VID `03c3`, PID `1f10`).
 //!
+//! ## macOS and Bluetooth privacy
+//!
+//! The unmodified macOS SDK creates a `CBCentralManager` from a static
+//! initializer, before `main` runs. macOS then kills the process (`SIGABRT`,
+//! no output) unless the *responsible app* (e.g. the terminal it was started
+//! from) declares `NSBluetoothAlwaysUsageDescription`. Without the
+//! `bluetooth` feature the build script removes the SDK's Bluetooth LE
+//! objects, so USB-only programs are unaffected. With `bluetooth`, apps need
+//! that key in their bundle's `Info.plist`, and command-line tools must be
+//! run from a terminal app that has it (iTerm2, VS Code; not Terminal.app).
+//! See "macOS notes" in the crate README.
+//!
 //! # Feature flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `bluetooth` | off | Exposes the `EAFBLE*` functions and callback types for BLE-capable focusers. |
+//! | `bluetooth` | off | Exposes the `EAFBLE*` functions and callback types for BLE-capable focusers. On macOS it also links the SDK's Bluetooth code unmodified (see above). |
 //!
 //! # Safety
 //!
@@ -187,7 +200,8 @@ pub struct EAF_BATTERY_INFO {
     pub battery_num_of_cycles: c_int,
 }
 
-/// Complete focuser state, returned in one round trip by [`EAFBLEgetAllInfo`].
+/// Complete focuser state, returned in one round trip by `EAFBLEgetAllInfo`
+/// (`bluetooth` feature).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EAF_ALL_INFO {
@@ -226,7 +240,7 @@ pub struct EAF_CONTROL_CAPS {
     pub unused: [c_char; 32],
 }
 
-/// A Bluetooth LE device found by [`EAFBLEScan`].
+/// A Bluetooth LE device found by `EAFBLEScan` (`bluetooth` feature).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BLE_DEVICE_INFO_T {
@@ -486,6 +500,32 @@ extern "C" {
     /// Returns `EAF_SUCCESS`, `EAF_BLE_DISCONNECT`, `EAF_ERROR_INVALID_ID`,
     /// `EAF_ERROR_INVALID_VALUE` or `EAF_ERROR_NOT_SUPPORTED`.
     pub fn EAFBLEgetAllInfo(ID: c_int, pAllInfo: *mut EAF_ALL_INFO) -> EAF_ERROR_CODE;
+}
+
+// ---------------------------------------------------------------------------
+// macOS: stand-in for the Bluetooth LE objects removed by build.rs
+// ---------------------------------------------------------------------------
+
+/// Set by `build.rs` on macOS when the `bluetooth` feature is off and the
+/// Bluetooth LE objects were removed from the staged `libEAFFocuser.a` (their
+/// static initializer creates a `CBCentralManager` before `main`, which TCC
+/// aborts in many environments; see the crate README, "macOS notes").
+///
+/// `EAF.o` still references `IBluetoothLEManager::CreateBluetoothLEManager()`
+/// from `EAFBLEScan`/`EAFBLEConnect`, the only two entry points that reach
+/// it. Neither is declared by this crate without the `bluetooth` feature, so
+/// this stub only satisfies the linker; if something declares and calls them
+/// anyway it aborts with an explanation instead of dereferencing null.
+#[cfg(zwo_eaf_ble_stripped)]
+mod ble_stub {
+    #[export_name = "_ZN19IBluetoothLEManager24CreateBluetoothLEManagerEv"]
+    extern "C" fn create_bluetooth_le_manager() -> *mut std::ffi::c_void {
+        eprintln!(
+            "zwo-eaf-sys: EAFBLEScan/EAFBLEConnect called, but zwo-eaf-sys was built \
+             without the `bluetooth` feature, which removes the SDK's Bluetooth LE code on macOS"
+        );
+        std::process::abort()
+    }
 }
 
 // ---------------------------------------------------------------------------

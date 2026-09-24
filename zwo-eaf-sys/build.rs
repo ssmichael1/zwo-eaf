@@ -9,10 +9,14 @@
 //!    normalized tarball layout (`include/`, `lib/` flat).
 //! 2. `ZWO_EAF_SDK_TARBALL` — a local copy of the per-target tarball published
 //!    on the GitHub release; verified and extracted exactly like a download.
-//! 3. Auto-discovery of a sibling `EAF_SDK_V1.8.1/` checkout next to the crate
-//!    or workspace.
+//! 3. Auto-discovery of an `EAF_SDK_V1.8.1/` checkout next to the crate or
+//!    any of its parent directories (so a sibling of the workspace is found).
 //! 4. Download of the per-target tarball from the `sdk-1.8.1` GitHub release,
 //!    SHA-256 verified and cached in `OUT_DIR`.
+//!
+//! On macOS without the `bluetooth` feature the staged copy of
+//! `libEAFFocuser.a` has its Bluetooth LE objects removed; see
+//! [`strip_macos_ble`] for why.
 //!
 //! When `DOCS_RS` is set all SDK work is skipped so the docs build offline.
 
@@ -107,6 +111,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZWO_EAF_SDK_PATH");
     println!("cargo:rerun-if-env-changed=ZWO_EAF_SDK_TARBALL");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
+    println!("cargo:rustc-check-cfg=cfg(zwo_eaf_ble_stripped)");
 
     if env::var_os("DOCS_RS").is_some() {
         println!("cargo:warning=zwo-eaf-sys: DOCS_RS detected, skipping SDK link");
@@ -159,16 +164,19 @@ fn main() {
 
     match tgt.os.as_str() {
         "macos" => {
+            let ble_stripped = env::var_os("CARGO_FEATURE_BLUETOOTH").is_none()
+                && strip_macos_ble(&link_dir.join("libEAFFocuser.a"));
+            if ble_stripped {
+                // Tells src/lib.rs to provide the stub for the one symbol
+                // the removed objects defined.
+                println!("cargo:rustc-cfg=zwo_eaf_ble_stripped");
+            }
             println!("cargo:rustc-link-lib=static=EAFFocuser");
-            for fw in [
-                "IOKit",
-                "CoreFoundation",
-                "Foundation",
-                "Cocoa",
-                "AppKit",
-                "CoreBluetooth",
-            ] {
+            for fw in ["IOKit", "CoreFoundation", "Foundation", "Cocoa", "AppKit"] {
                 println!("cargo:rustc-link-lib=framework={fw}");
+            }
+            if !ble_stripped {
+                println!("cargo:rustc-link-lib=framework=CoreBluetooth");
             }
             println!("cargo:rustc-link-lib=c++");
         }
@@ -200,15 +208,147 @@ fn stage_link_dir(lib_dir: &Path, out_dir: &Path, tgt: &Target) -> PathBuf {
         let src = lib_dir.join(f);
         let dst = link_dir.join(f);
         println!("cargo:rerun-if-changed={}", src.display());
-        fs::copy(&src, &dst).unwrap_or_else(|e| {
-            panic!(
-                "zwo-eaf-sys: copy {} -> {}: {e}",
-                src.display(),
-                dst.display()
-            )
-        });
+        // The copy may be modified afterwards (see `strip_macos_ble`), and
+        // `fs::copy` carries over a read-only mode from the SDK, so replace
+        // rather than overwrite and make sure the result is writable.
+        let _ = fs::remove_file(&dst);
+        fs::copy(&src, &dst)
+            .and_then(|_| make_owner_writable(&dst))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "zwo-eaf-sys: copy {} -> {}: {e}",
+                    src.display(),
+                    dst.display()
+                )
+            });
     }
     link_dir
+}
+
+#[cfg(unix)]
+fn make_owner_writable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o200);
+    fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn make_owner_writable(path: &Path) -> std::io::Result<()> {
+    let mut perms = fs::metadata(path)?.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(path, perms)
+}
+
+/// Archive members of the macOS `libEAFFocuser.a` that implement Bluetooth
+/// LE. Removed from the staged copy unless the `bluetooth` feature is on.
+const MACOS_BLE_MEMBERS: &[&str] = &[
+    "IBluetoothLEManager.o",
+    "BluetoothLEManagerWin.o",
+    "BluetoothLEManagerMac.o",
+    "MacBLEManagerBridge.o",
+    "MacCoreBluetoothImp.o",
+];
+
+/// Remove the Bluetooth LE objects from the staged macOS archive. Returns
+/// `true` on success; on any failure the archive is left intact (and the
+/// caller keeps linking CoreBluetooth) after a build warning.
+///
+/// Why: `BluetoothLEManagerWin.o` has a C++ static initializer
+/// (`g_pBleManager = new BluetoothLEManagerMac()`) that creates a
+/// `CBCentralManager` and spins the run loop waiting for it, *while dyld is
+/// loading the executable*, before `main`. It is always linked in, because
+/// `EAF.o` (needed by every SDK function) references
+/// `IBluetoothLEManager::CreateBluetoothLEManager()`, whose object references
+/// `BluetoothLEManagerWin`'s vtable. Creating a `CBCentralManager` makes TCC
+/// check that the process's *responsible* app has
+/// `NSBluetoothAlwaysUsageDescription` in its Info.plist; if it does not
+/// (Terminal.app, Claude Code, some IDEs) TCC kills the process with SIGABRT.
+/// So without this, every program linking the SDK dies at startup in those
+/// environments even if it only ever talks USB.
+///
+/// Only `EAFBLEScan` and `EAFBLEConnect` reach `CreateBluetoothLEManager`;
+/// those are declared only with the `bluetooth` feature, and `src/lib.rs`
+/// supplies an aborting stub for the symbol (cfg `zwo_eaf_ble_stripped`).
+fn strip_macos_ble(archive: &Path) -> bool {
+    use std::process::Command;
+
+    let target = env::var("TARGET").unwrap_or_default();
+    let ar_var = format!("AR_{}", target.replace('-', "_"));
+    let ar_vars = [ar_var.as_str(), "TARGET_AR", "AR"];
+    for v in ar_vars {
+        println!("cargo:rerun-if-env-changed={v}");
+    }
+    let ar = ar_vars
+        .iter()
+        .find_map(env::var_os)
+        .unwrap_or_else(|| "ar".into());
+    let ar_name = ar.to_string_lossy().into_owned();
+
+    let warn = |msg: String| {
+        println!(
+            "cargo:warning=zwo-eaf-sys: {msg}; linking the unmodified SDK archive, whose \
+             static initializer creates a CBCentralManager at load time (see README, macOS notes)"
+        );
+        false
+    };
+    let run = |args: &[&str], path: &Path| -> Result<String, String> {
+        let out = Command::new(&ar)
+            .arg(args[0])
+            .arg(path)
+            .args(&args[1..])
+            .output()
+            .map_err(|e| format!("cannot run `{ar_name}`: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!(
+                "`{ar_name} {}` failed: {}",
+                args[0],
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    };
+
+    let listing = match run(&["t"], archive) {
+        Ok(s) => s,
+        Err(e) => return warn(e),
+    };
+    let present: Vec<&str> = listing.lines().map(str::trim).collect();
+    if let Some(missing) = MACOS_BLE_MEMBERS.iter().find(|m| !present.contains(m)) {
+        return warn(format!(
+            "unexpected libEAFFocuser.a layout (member {missing} not found)"
+        ));
+    }
+
+    // Work on a temporary copy so a failure half way leaves the staged
+    // archive untouched. `d` deletes the members; `s` rewrites the symbol
+    // table (`__.SYMDEF`) that ld64 uses to pull members in.
+    let tmp = archive.with_extension("a.tmp");
+    let _ = fs::remove_file(&tmp);
+    if let Err(e) = fs::copy(archive, &tmp) {
+        return warn(format!(
+            "copy {} -> {}: {e}",
+            archive.display(),
+            tmp.display()
+        ));
+    }
+    let delete: Vec<&str> = std::iter::once("d")
+        .chain(MACOS_BLE_MEMBERS.iter().copied())
+        .collect();
+    if let Err(e) = run(&delete, &tmp).and_then(|_| run(&["s"], &tmp)) {
+        let _ = fs::remove_file(&tmp);
+        return warn(e);
+    }
+    if let Err(e) = fs::rename(&tmp, archive) {
+        return warn(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            archive.display()
+        ));
+    }
+    true
 }
 
 /// Given an SDK root, return the directory holding this target's libraries.
@@ -226,7 +366,11 @@ fn lib_dir_in_sdk_root(root: &Path, tgt: &Target) -> Option<PathBuf> {
         .find(|cand| cand.join(lib_file).exists())
 }
 
-/// Probe for a sibling SDK checkout when no env var is set.
+/// Probe for an SDK checkout when no env var is set: `EAF_SDK_V<ver>/<sub>`
+/// or a bare `<sub>` in the crate's parent directory or any ancestor of it.
+/// Cargo does not tell build scripts where the workspace root is, but walking
+/// all ancestors covers "next to the workspace" however deeply the crate is
+/// nested (including git worktrees inside the repository).
 fn discover_sdk(manifest_dir: &Path, tgt: &Target) -> Option<PathBuf> {
     let sdk_dir = format!("EAF_SDK_V{SDK_VERSION}");
     let sub = if tgt.os == "windows" {
@@ -234,21 +378,12 @@ fn discover_sdk(manifest_dir: &Path, tgt: &Target) -> Option<PathBuf> {
     } else {
         "eaf".to_string()
     };
-    let mut bases = vec![
-        manifest_dir.join(".."),
-        manifest_dir.join("../.."),
-        manifest_dir.join("../../.."),
-    ];
-    if let Some(ws) = env::var_os("CARGO_WORKSPACE_DIR") {
-        let ws = PathBuf::from(ws);
-        bases.insert(0, ws.join(".."));
-        bases.insert(1, ws.clone());
-    }
-    bases
-        .into_iter()
+    manifest_dir
+        .ancestors()
+        .skip(1)
         .flat_map(|b| [b.join(&sdk_dir).join(&sub), b.join(&sub)])
-        .map(|p| p.canonicalize().unwrap_or(p))
         .find(|p| lib_dir_in_sdk_root(p, tgt).is_some())
+        .map(|p| p.canonicalize().unwrap_or(p))
 }
 
 fn expected_sha(tgt: &Target) -> &'static str {

@@ -84,6 +84,15 @@ pub enum Error {
     /// The SDK returned a null pointer where a string was expected.
     #[error("SDK returned a null string")]
     NullString,
+    /// A [`Focuser`](crate::Focuser) with this ID is already open in this
+    /// process. The SDK keeps one connection per ID, so a second handle
+    /// would be closed from under it when the first is dropped.
+    #[error("focuser is already open")]
+    AlreadyOpen,
+    /// A string passed to the SDK (e.g. a Bluetooth device name or address)
+    /// contains an interior NUL byte and cannot be converted to a C string.
+    #[error("string contains an interior NUL byte")]
+    InteriorNul,
     /// An error code not mapped by this crate (possibly from a newer SDK).
     #[error("unknown error code: {0}")]
     Unknown(i32),
@@ -186,5 +195,6 @@ mod tests {
     fn display_is_human_readable() {
         assert_eq!(Error::Moving.to_string(), "focuser is moving");
         assert_eq!(Error::Unknown(99).to_string(), "unknown error code: 99");
+        assert_eq!(Error::AlreadyOpen.to_string(), "focuser is already open");
     }
 }

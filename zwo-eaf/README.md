@@ -26,19 +26,68 @@ fn main() -> zwo_eaf::Result<()> {
 
 Run `cargo run --example list` to print the state of every attached focuser.
 
+Only one `Focuser` per ID may be open at a time in a process, since dropping
+a handle closes the SDK connection for that ID; a second `Focuser::open` of
+the same ID returns `Error::AlreadyOpen`.
+
 ## Hardware tests
 
 `cargo test` needs no hardware. The tests in `tests/focuser.rs` are ignored
-by default, only read state, and never move the focuser:
+by default, only read state, and never move the focuser. With no focuser
+attached they print `no EAF focuser attached; skipping` and pass:
 
 ```sh
 cargo test -p zwo-eaf -- --ignored --nocapture --test-threads=1
 ```
 
-## Future work
+## Feature flags
 
-The SDK's Bluetooth LE API (scan, connect, pair, callbacks) is bound in
-`zwo-eaf-sys` behind its `bluetooth` feature but not yet wrapped here.
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `bluetooth` | off | Bluetooth LE support: `ble::scan`, `ble::connect`, pairing, `Focuser::all_info` and connection/pairing callbacks. Enables `zwo-eaf-sys/bluetooth`. |
+
+## Bluetooth
+
+Battery-powered focusers (e.g. EAF Pro) can be controlled over Bluetooth LE
+with the `bluetooth` feature:
+
+```toml
+zwo-eaf = { version = "0.1", features = ["bluetooth"] }
+```
+
+```rust
+use std::time::Duration;
+use zwo_eaf::ble;
+
+fn main() -> zwo_eaf::Result<()> {
+    let devices = ble::scan(Duration::from_secs(3))?;
+    if let Some(dev) = devices.iter().find(|d| d.is_eaf()) {
+        let eaf = dev.connect()?; // or ble::connect("EAF Pro_90c92c", None)
+        eaf.pair()?;              // required before any other command
+        let info = eaf.all_info()?;
+        println!("{} at step {} ({:.1} °C)", dev.name, info.position, info.temperature);
+    } // dropping the Focuser disconnects
+    Ok(())
+}
+```
+
+The connected handle is an ordinary `Focuser`; every method works over BLE
+except `ble_name` (USB only). The BLE-only methods (`pair`, `clear_pair`,
+`all_info`, callbacks) return `Error::NotSupported` on a USB handle.
+
+Connection and pairing callbacks take closures, but the SDK's C callbacks
+carry no device ID or user data, so each kind has **one process-wide slot**:
+the last registration wins, and a closure cannot tell which device an event
+came from. Closures run on SDK threads (`Send + Sync + 'static`); panics are
+caught. Clear them with `Focuser::clear_*_callback` or `ble::clear_callbacks`.
+
+Identify devices by name; on macOS the SDK does not report a usable address.
+
+```sh
+cargo run -p zwo-eaf --features bluetooth --example ble_scan                    # scan only
+cargo run -p zwo-eaf --features bluetooth --example ble_scan -- "EAF Pro_90c92c" # connect, pair, read
+cargo test -p zwo-eaf --features bluetooth --test ble -- --ignored --nocapture --test-threads=1
+```
 
 ## License
 

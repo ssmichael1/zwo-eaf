@@ -77,7 +77,8 @@ pub struct ControlCaps {
     pub max_value: i32,
     pub min_value: i32,
     pub default_value: i32,
-    /// `Err(Unknown)` if the SDK reports a type this crate does not know.
+    /// `Err(code)` with the raw SDK value if the SDK reports a type this
+    /// crate does not know.
     pub control_type: std::result::Result<ControlType, i32>,
 }
 

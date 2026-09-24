@@ -14,3 +14,19 @@ categories = ["api-bindings", "science", "hardware-support"]
 [dependencies]
 zwo-eaf-sys = { path = "../zwo-eaf-sys", version = "0.1.0" }
 thiserror = "2"
+
+[features]
+# Bluetooth LE support (scan, connect, pair, callbacks).
+bluetooth = ["zwo-eaf-sys/bluetooth"]
+
+[[example]]
+name = "ble_scan"
+required-features = ["bluetooth"]
+
+[[test]]
+name = "ble"
+required-features = ["bluetooth"]
+
+[package.metadata.docs.rs]
+features = ["bluetooth"]
+rustdoc-args = ["--cfg", "docsrs"]
